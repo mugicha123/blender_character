@@ -1,0 +1,374 @@
+bl_info = {
+    "name": "Anime Shader Generator",
+    "author": "User",
+    "version": (1, 8, 0),
+    "blender": (4, 1, 0),
+    "location": "Shader Editor > Sidebar > Add anime shader",
+    "description": "Adds a separate anime shader node network without connecting to existing nodes.",
+    "category": "Material",
+}
+
+import bpy
+
+SHADOW_PROP = "ts_shadow_col_v2"
+LIGHT_PROP = "ts_light_col_v2"
+SHADOW_POS_PROP = "ts_shadow_pos_v2"
+LIGHT_POS_PROP = "ts_light_pos_v2"
+TEXTURE_IMAGE_PROP = "ts_texture_image_v2"
+
+
+class OBJECT_OT_add_anime_shader(bpy.types.Operator):
+    bl_idname = "object.add_anime_shader"
+    bl_label = "Add Anime Shader"
+    bl_description = "Add the anime shader to the material selected in Material Properties"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        # Target the material selected in Material Properties (active material slot).
+        obj = context.active_object
+        mat = obj.active_material if obj and hasattr(obj, "active_material") else None
+        if mat is None:
+            mat = getattr(context, "material", None)
+        if mat is None:
+            self.report({'WARNING'}, "Select a material in Material Properties first.")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        # Blenderのバージョンに応じて利用可能なEeveeエンジンを選択
+        engine_items = scene.render.bl_rna.properties['engine'].enum_items
+        available_engines = {item.identifier for item in engine_items}
+        if 'BLENDER_EEVEE_NEXT' in available_engines:
+            scene.render.engine = 'BLENDER_EEVEE_NEXT'
+        elif 'BLENDER_EEVEE' in available_engines:
+            scene.render.engine = 'BLENDER_EEVEE'
+        else:
+            self.report({'ERROR'}, "Eevee render engine is not available in this Blender version.")
+            return {'CANCELLED'}
+
+        shadow_col = tuple(scene.ts_shadow_col_v2)
+        light_col = tuple(scene.ts_light_col_v2)
+
+        # Preserve the material's existing nodes and add the anime shader alongside them.
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        # Remember nodes that were selected before generating the anime shader.
+        previously_selected_nodes = [node for node in nodes if node.select]
+
+        # Keep the original node network completely untouched and unconnected.
+        # Create a separate Material Output for the anime shader network.
+        output = nodes.new(type='ShaderNodeOutputMaterial')
+        output.location = (650, 0)
+        output.label = "Anime Shader Output (Separate)"
+
+        # Mix Shader
+        mix = nodes.new(type='ShaderNodeMixShader')
+        mix.location = (420, 0)
+        mix.inputs[0].default_value = 0.7
+
+        # Principled BSDF: base color is driven by the toon ramp
+        principled = nodes.new(type='ShaderNodeBsdfPrincipled')
+        principled.location = (100, 180)
+        principled.inputs['Roughness'].default_value = 0.5
+        principled.inputs['Metallic'].default_value = 0.01
+
+        # Diffuse BSDF -> Shader to RGB -> Color Ramp
+        diffuse = nodes.new(type='ShaderNodeBsdfDiffuse')
+        diffuse.location = (-800, -100)
+
+        # Correct Blender node identifier uses RGB (uppercase)
+        try:
+            shader_to_rgb = nodes.new(type='ShaderNodeShaderToRGB')
+        except RuntimeError:
+            self.report(
+                {'ERROR'},
+                "Could not create Shader to RGB. Please use Blender with Eevee support."
+            )
+            return {'CANCELLED'}
+        shader_to_rgb.location = (-570, -100)
+
+        ramp_node = nodes.new(type='ShaderNodeValToRGB')
+        ramp_node.location = (-310, -100)
+        ramp = ramp_node.color_ramp
+        ramp.interpolation = 'LINEAR'
+        ramp.elements[0].position = scene.ts_shadow_pos_v2
+        ramp.elements[0].color = shadow_col
+        ramp.elements[1].position = scene.ts_light_pos_v2
+        ramp.elements[1].color = light_col
+
+        # Rampの色をEmissionシェーダーに変換してからMix Shaderへ接続
+        emission = nodes.new(type='ShaderNodeEmission')
+        emission.location = (120, -160)
+
+        # ノード接続
+        links.new(diffuse.outputs['BSDF'], shader_to_rgb.inputs['Shader'])
+        links.new(shader_to_rgb.outputs['Color'], ramp_node.inputs['Fac'])
+        links.new(ramp_node.outputs['Color'], principled.inputs['Base Color'])
+        links.new(ramp_node.outputs['Color'], emission.inputs['Color'])
+        links.new(principled.outputs['BSDF'], mix.inputs[1])
+        links.new(emission.outputs['Emission'], mix.inputs[2])
+        # Connect only the newly-created anime shader nodes to the new output.
+        # Do not link to, disconnect, or modify any pre-existing nodes.
+        links.new(mix.outputs['Shader'], output.inputs['Surface'])
+
+        # Deselect nodes that were selected before shader generation.
+        for node in previously_selected_nodes:
+            try:
+                node.select = False
+            except ReferenceError:
+                pass
+
+        self.report({'INFO'}, f"Anime shader added to material: {mat.name}")
+        return {'FINISHED'}
+
+
+class OBJECT_OT_add_anime_shader_textures(bpy.types.Operator):
+    bl_idname = "object.add_anime_shader_textures"
+    bl_label = "Add Anime Shader"
+    bl_description = "Create a separate anime shader network using the selected texture"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        image = getattr(scene, TEXTURE_IMAGE_PROP, None)
+        if image is None:
+            self.report({'WARNING'}, "Select a texture image first.")
+            return {'CANCELLED'}
+
+        obj = context.active_object
+        mat = obj.active_material if obj and hasattr(obj, "active_material") else None
+        if mat is None:
+            mat = getattr(context, "material", None)
+        if mat is None:
+            self.report({'WARNING'}, "Select a material in Material Properties first.")
+            return {'CANCELLED'}
+
+        engine_items = scene.render.bl_rna.properties['engine'].enum_items
+        available_engines = {item.identifier for item in engine_items}
+        if 'BLENDER_EEVEE_NEXT' in available_engines:
+            scene.render.engine = 'BLENDER_EEVEE_NEXT'
+        elif 'BLENDER_EEVEE' in available_engines:
+            scene.render.engine = 'BLENDER_EEVEE'
+        else:
+            self.report({'ERROR'}, "Shader to RGB requires an Eevee render engine.")
+            return {'CANCELLED'}
+
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        previously_selected_nodes = [node for node in nodes if node.select]
+
+        # Add a completely separate network; preserve all existing nodes and links.
+        output = nodes.new(type='ShaderNodeOutputMaterial')
+        output.location = (900, -220)
+        output.label = "Texture Anime Shader Output (Separate)"
+
+        mix_shader = nodes.new(type='ShaderNodeMixShader')
+        mix_shader.location = (650, -220)
+        mix_shader.inputs[0].default_value = 0.700
+
+        principled = nodes.new(type='ShaderNodeBsdfPrincipled')
+        principled.location = (180, -40)
+        principled.inputs['Metallic'].default_value = 0.010
+        principled.inputs['Roughness'].default_value = 0.500
+        principled.inputs['IOR'].default_value = 1.500
+        principled.inputs['Alpha'].default_value = 1.000
+
+        diffuse = nodes.new(type='ShaderNodeBsdfDiffuse')
+        diffuse.location = (-1000, -40)
+        diffuse.inputs['Roughness'].default_value = 0.000
+
+        try:
+            shader_to_rgb = nodes.new(type='ShaderNodeShaderToRGB')
+        except RuntimeError:
+            self.report({'ERROR'}, "Could not create Shader to RGB. Please use Blender with Eevee support.")
+            return {'CANCELLED'}
+        shader_to_rgb.location = (-760, -40)
+
+        ramp_node = nodes.new(type='ShaderNodeValToRGB')
+        ramp_node.location = (-520, -40)
+        ramp = ramp_node.color_ramp
+        ramp.interpolation = 'LINEAR'
+        ramp.elements[0].position = 0.209
+        ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+        ramp.elements[1].position = 0.223
+        ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+
+        image_node = nodes.new(type='ShaderNodeTexImage')
+        image_node.location = (-745, -313)
+        image_node.image = image
+
+        hsv = nodes.new(type='ShaderNodeHueSaturation')
+        hsv.location = (-350, -420)
+        hsv.inputs['Hue'].default_value = 0.500
+        hsv.inputs['Saturation'].default_value = 1.500
+        hsv.inputs['Value'].default_value = 0.250
+        hsv.inputs['Fac'].default_value = 1.000
+
+        mix_color = nodes.new(type='ShaderNodeMixRGB')
+        mix_color.location = (-100, -120)
+        mix_color.label = "Mix Color"
+
+        emission = nodes.new(type='ShaderNodeEmission')
+        emission.location = (250, -420)
+
+        links.new(diffuse.outputs['BSDF'], shader_to_rgb.inputs['Shader'])
+        links.new(shader_to_rgb.outputs['Color'], ramp_node.inputs['Fac'])
+        links.new(image_node.outputs['Color'], hsv.inputs['Color'])
+        links.new(hsv.outputs['Color'], mix_color.inputs['Color1'])
+        links.new(image_node.outputs['Color'], mix_color.inputs['Color2'])
+        links.new(ramp_node.outputs['Color'], mix_color.inputs['Fac'])
+        links.new(mix_color.outputs['Color'], principled.inputs['Base Color'])
+        links.new(mix_color.outputs['Color'], emission.inputs['Color'])
+        links.new(principled.outputs['BSDF'], mix_shader.inputs[1])
+        links.new(emission.outputs['Emission'], mix_shader.inputs[2])
+        links.new(mix_shader.outputs['Shader'], output.inputs['Surface'])
+
+        for node in previously_selected_nodes:
+            try:
+                node.select = False
+            except ReferenceError:
+                pass
+
+        self.report({'INFO'}, f"Texture anime shader added to material: {mat.name}")
+        return {'FINISHED'}
+
+
+class VIEW3D_PT_anime_shader_root(bpy.types.Panel):
+    bl_label = "Anime shader"
+    bl_idname = "VIEW3D_PT_anime_shader_root"
+    bl_space_type = 'NODE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "Add anime shader"
+
+    @classmethod
+    def poll(cls, context):
+        space = context.space_data
+        return space is not None and space.type == 'NODE_EDITOR' and space.tree_type == 'ShaderNodeTree'
+
+    def draw(self, context):
+        # Parent panel: the child panels below contain the actual controls.
+        pass
+
+
+class VIEW3D_PT_anime_shader_panel(bpy.types.Panel):
+    bl_label = "single color"
+    bl_idname = "VIEW3D_PT_anime_shader_panel"
+    bl_parent_id = "VIEW3D_PT_anime_shader_root"
+    bl_space_type = 'NODE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "Add anime shader"
+
+    @classmethod
+    def poll(cls, context):
+        space = context.space_data
+        return space is not None and space.type == 'NODE_EDITOR' and space.tree_type == 'ShaderNodeTree'
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        layout.label(text="Color Settings")
+        layout.prop(scene, SHADOW_PROP, text="Shadow Color")
+        layout.prop(scene, SHADOW_POS_PROP, text="Shadow Position")
+        layout.prop(scene, LIGHT_PROP, text="Light Color")
+        layout.prop(scene, LIGHT_POS_PROP, text="Light Position")
+        layout.separator()
+        layout.operator("object.add_anime_shader", icon='MATERIAL')
+
+
+class VIEW3D_PT_anime_shader_textures_panel(bpy.types.Panel):
+    bl_label = "textures"
+    bl_idname = "VIEW3D_PT_anime_shader_textures_panel"
+    bl_parent_id = "VIEW3D_PT_anime_shader_root"
+    bl_space_type = 'NODE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "Add anime shader"
+    bl_order = 1
+
+    @classmethod
+    def poll(cls, context):
+        space = context.space_data
+        return space is not None and space.type == 'NODE_EDITOR' and space.tree_type == 'ShaderNodeTree'
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+
+        # Label and image datablock selector with the same controls as
+        # the Image Texture node's image field.
+        layout.label(text="Select texture")
+        layout.template_ID(scene, TEXTURE_IMAGE_PROP, open="image.open", new="image.new")
+        layout.operator("object.add_anime_shader_textures", text="Add anime shader", icon='MATERIAL')
+
+
+classes = (
+    OBJECT_OT_add_anime_shader_textures,
+    OBJECT_OT_add_anime_shader,
+    VIEW3D_PT_anime_shader_root,
+    VIEW3D_PT_anime_shader_panel,
+    VIEW3D_PT_anime_shader_textures_panel,
+)
+
+
+def unregister():
+    # Unregister classes first, then remove Scene properties.
+    for cls in reversed(classes):
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
+
+    for prop in (SHADOW_PROP, LIGHT_PROP, SHADOW_POS_PROP, LIGHT_POS_PROP, TEXTURE_IMAGE_PROP):
+        if hasattr(bpy.types.Scene, prop):
+            delattr(bpy.types.Scene, prop)
+
+
+def register():
+    # Avoid duplicate registration when re-running the script.
+    unregister()
+
+    bpy.types.Scene.ts_texture_image_v2 = bpy.props.PointerProperty(
+        name="Texture Image",
+        description="Image used by the texture anime shader",
+        type=bpy.types.Image,
+    )
+
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+    bpy.types.Scene.ts_shadow_col_v2 = bpy.props.FloatVectorProperty(
+        name="Shadow Color",
+        subtype='COLOR',
+        size=4,
+        default=(0.610496, 0.381326, 0.346704, 1.0),
+        min=0.0,
+        max=1.0,
+    )
+    bpy.types.Scene.ts_light_col_v2 = bpy.props.FloatVectorProperty(
+        name="Light Color",
+        subtype='COLOR',
+        size=4,
+        default=(0.955973, 0.768151, 0.665387, 1.0),
+        min=0.0,
+        max=1.0,
+    )
+    bpy.types.Scene.ts_shadow_pos_v2 = bpy.props.FloatProperty(
+        name="Shadow Position",
+        description="Position of the shadow color stop on the Color Ramp",
+        default=0.2,
+        min=0.0,
+        max=1.0,
+        precision=3,
+    )
+    bpy.types.Scene.ts_light_pos_v2 = bpy.props.FloatProperty(
+        name="Light Position",
+        description="Position of the light color stop on the Color Ramp",
+        default=0.35,
+        min=0.0,
+        max=1.0,
+        precision=3,
+    )
+
+
+if __name__ == "__main__":
+    register()
