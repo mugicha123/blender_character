@@ -1,9 +1,9 @@
 bl_info = {
-    "name": "Anime Shader Generator",
+    "name": "blender_character",
     "author": "User",
     "version": (1, 8, 0),
     "blender": (4, 1, 0),
-    "location": "Shader Editor > Sidebar > Add anime shader",
+    "location": "Shader Editor > Sidebar > Shading",
     "description": "Adds a separate anime shader node network without connecting to existing nodes.",
     "category": "Material",
 }
@@ -234,27 +234,9 @@ class OBJECT_OT_add_anime_shader_textures(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class VIEW3D_PT_anime_shader_root(bpy.types.Panel):
-    bl_label = "Anime shader"
-    bl_idname = "VIEW3D_PT_anime_shader_root"
-    bl_space_type = 'NODE_EDITOR'
-    bl_region_type = 'UI'
-    bl_category = "Add anime shader"
-
-    @classmethod
-    def poll(cls, context):
-        space = context.space_data
-        return space is not None and space.type == 'NODE_EDITOR' and space.tree_type == 'ShaderNodeTree'
-
-    def draw(self, context):
-        # Parent panel: the child panels below contain the actual controls.
-        pass
-
-
 class VIEW3D_PT_anime_shader_panel(bpy.types.Panel):
-    bl_label = "single color"
+    bl_label = "Anime shader for single color"
     bl_idname = "VIEW3D_PT_anime_shader_panel"
-    bl_parent_id = "VIEW3D_PT_anime_shader_root"
     bl_space_type = 'NODE_EDITOR'
     bl_region_type = 'UI'
     bl_category = "Add anime shader"
@@ -276,10 +258,11 @@ class VIEW3D_PT_anime_shader_panel(bpy.types.Panel):
         layout.operator("object.add_anime_shader", icon='MATERIAL')
 
 
+
+
 class VIEW3D_PT_anime_shader_textures_panel(bpy.types.Panel):
-    bl_label = "textures"
+    bl_label = "Anime shader for textures"
     bl_idname = "VIEW3D_PT_anime_shader_textures_panel"
-    bl_parent_id = "VIEW3D_PT_anime_shader_root"
     bl_space_type = 'NODE_EDITOR'
     bl_region_type = 'UI'
     bl_category = "Add anime shader"
@@ -301,13 +284,156 @@ class VIEW3D_PT_anime_shader_textures_panel(bpy.types.Panel):
         layout.operator("object.add_anime_shader_textures", text="Add anime shader", icon='MATERIAL')
 
 
+class MESH_OT_apply_character_offset(bpy.types.Operator):
+    bl_idname = "mesh.apply_character_offset"
+    bl_label = "Apply Character Offset"
+    bl_description = "Apply the Offset value to selected mesh geometry using Shrink/Fatten"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.mode == 'EDIT_MESH'
+            and context.edit_object is not None
+            and context.edit_object.type == 'MESH'
+        )
+
+    def execute(self, context):
+        offset = context.scene.character_object_offset
+
+        # Apply the panel's Offset value as a direct Shrink/Fatten operation.
+        # Positive values move selected geometry outward; negative values inward.
+        try:
+            result = bpy.ops.transform.shrink_fatten(value=offset)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Could not apply Offset: {exc}")
+            return {'CANCELLED'}
+
+        if 'CANCELLED' in result:
+            self.report({'WARNING'}, "Shrink/Fatten could not be applied. Check the mesh selection.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Applied Offset: {offset:g} m")
+        return {'FINISHED'}
+
+
+class MESH_OT_create_offset_shrinkwrap_object(bpy.types.Operator):
+    bl_idname = "mesh.create_offset_shrinkwrap_object"
+    bl_label = "Create an object"
+    bl_description = (
+        "Duplicate the selected faces, apply Blender Shrink/Fatten using Offset, "
+        "and add an unapplied Shrinkwrap modifier targeting the source object"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        source_obj = context.edit_object
+        if source_obj is None or source_obj.type != 'MESH':
+            self.report({'WARNING'}, "Enter Mesh Edit Mode first.")
+            return {'CANCELLED'}
+
+        if context.mode != 'EDIT_MESH':
+            self.report({'WARNING'}, "This tool works in Mesh Edit Mode.")
+            return {'CANCELLED'}
+
+        import bmesh
+        bm = bmesh.from_edit_mesh(source_obj.data)
+        selected_faces = [face for face in bm.faces if face.select]
+        if not selected_faces:
+            self.report({'WARNING'}, "Select one or more faces first.")
+            return {'CANCELLED'}
+
+        offset = context.scene.character_object_offset
+        objects_before = set(bpy.data.objects)
+
+        try:
+            # 1) Duplicate the selected faces and separate the duplicate
+            # into a new object. The source mesh remains in place.
+            bpy.ops.mesh.duplicate()
+            bpy.ops.mesh.separate(type='SELECTED')
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+            created_objects = [obj for obj in bpy.data.objects if obj not in objects_before]
+            if not created_objects:
+                self.report({'ERROR'}, "The separated object could not be found.")
+                return {'CANCELLED'}
+
+            new_obj = created_objects[-1]
+
+            # Make only the new object active before running the standard
+            # Blender Shrink/Fatten transform in Edit Mode.
+            bpy.ops.object.select_all(action='DESELECT')
+            new_obj.select_set(True)
+            context.view_layer.objects.active = new_obj
+            bpy.ops.object.mode_set(mode='EDIT')
+
+            # Separate may preserve the selection, but explicitly select all
+            # copied faces so the entire new surface receives the Offset.
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.transform.shrink_fatten(value=offset)
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+            # Add Shrinkwrap AFTER Shrink/Fatten. Keep it unapplied and
+            # target the original body object.
+            shrinkwrap = new_obj.modifiers.new(name="Shrinkwrap", type='SHRINKWRAP')
+            shrinkwrap.target = source_obj
+            shrinkwrap.offset = offset
+
+        except Exception as exc:
+            # Try to leave Blender in Object Mode if an operation failed.
+            try:
+                if context.object and context.object.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                pass
+            self.report({'ERROR'}, f"Could not create the offset object: {exc}")
+            return {'CANCELLED'}
+
+        # Keep the source body intact and select the newly-created object.
+        bpy.ops.object.select_all(action='DESELECT')
+        new_obj.select_set(True)
+        context.view_layer.objects.active = new_obj
+
+        self.report(
+            {'INFO'},
+            f"Created {new_obj.name}; Shrink/Fatten offset: {offset:g} m; "
+            "Shrinkwrap added (not applied)."
+        )
+        return {'FINISHED'}
+
+
+class VIEW3D_PT_character_object_tool(bpy.types.Panel):
+    bl_label = "Create Object"
+    bl_idname = "VIEW3D_PT_character_object_tool"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Edit"
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH' and context.edit_object is not None
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(context.scene, "character_object_offset", text="Offset")
+        layout.operator(
+            "mesh.create_offset_shrinkwrap_object",
+            text="Create an object"
+        )
+
+
+
 classes = (
     OBJECT_OT_add_anime_shader_textures,
     OBJECT_OT_add_anime_shader,
-    VIEW3D_PT_anime_shader_root,
     VIEW3D_PT_anime_shader_panel,
     VIEW3D_PT_anime_shader_textures_panel,
+    MESH_OT_apply_character_offset,
+    MESH_OT_create_offset_shrinkwrap_object,
+    VIEW3D_PT_character_object_tool,
 )
+
+
 
 
 def unregister():
@@ -318,7 +444,7 @@ def unregister():
         except RuntimeError:
             pass
 
-    for prop in (SHADOW_PROP, LIGHT_PROP, SHADOW_POS_PROP, LIGHT_POS_PROP, TEXTURE_IMAGE_PROP):
+    for prop in (SHADOW_PROP, LIGHT_PROP, SHADOW_POS_PROP, LIGHT_POS_PROP, TEXTURE_IMAGE_PROP, 'character_object_offset'):
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)
 
@@ -333,8 +459,17 @@ def register():
         type=bpy.types.Image,
     )
 
+    bpy.types.Scene.character_object_offset = bpy.props.FloatProperty(
+        name='Offset',
+        description='Offset used by Blender Shrink/Fatten when creating the copied surface',
+        default=0.0,
+        unit='LENGTH',
+        precision=4,
+    )
+
     for cls in classes:
         bpy.utils.register_class(cls)
+
 
     bpy.types.Scene.ts_shadow_col_v2 = bpy.props.FloatVectorProperty(
         name="Shadow Color",
