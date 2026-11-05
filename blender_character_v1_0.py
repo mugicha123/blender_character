@@ -1,7 +1,7 @@
 bl_info = {
     "name": "blender_character",
     "author": "User",
-    "version": (1, 8, 0),
+    "version": (1, 9, 0),
     "blender": (4, 1, 0),
     "location": "Shader Editor > Sidebar > Shading",
     "description": "Adds a separate anime shader node network without connecting to existing nodes.",
@@ -403,7 +403,7 @@ class MESH_OT_create_offset_shrinkwrap_object(bpy.types.Operator):
 
 
 class VIEW3D_PT_character_object_tool(bpy.types.Panel):
-    bl_label = "Create Object"
+    bl_label = "Create Clothes"
     bl_idname = "VIEW3D_PT_character_object_tool"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -418,7 +418,132 @@ class VIEW3D_PT_character_object_tool(bpy.types.Panel):
         layout.prop(context.scene, "character_object_offset", text="Offset")
         layout.operator(
             "mesh.create_offset_shrinkwrap_object",
-            text="Create an object"
+            text="Create Clothes"
+        )
+
+
+
+# ------------------------------------------------------------------------
+# Data Transfer + Armature automation
+# ------------------------------------------------------------------------
+
+def _is_mesh_object(self, obj):
+    return obj is not None and obj.type == 'MESH'
+
+
+def _is_armature_object(self, obj):
+    return obj is not None and obj.type == 'ARMATURE'
+
+
+class OBJECT_OT_transfer_vertex_groups_and_add_armature(bpy.types.Operator):
+    bl_idname = "object.transfer_vertex_groups_and_add_armature"
+    bl_label = "Generate Data Transfer + Armature"
+    bl_description = (
+        "Transfer vertex groups from the Source mesh, apply Data Transfer, "
+        "then add an Armature modifier at the top of the stack"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            context.mode == 'OBJECT'
+            and obj is not None
+            and obj.type == 'MESH'
+        )
+
+    def execute(self, context):
+        target = context.active_object
+        source_obj = context.scene.character_data_transfer_source
+        armature_obj = context.scene.character_data_transfer_armature
+
+        if target is None or target.type != 'MESH':
+            self.report({'WARNING'}, "Select the target mesh object first.")
+            return {'CANCELLED'}
+
+        if source_obj is None or source_obj.type != 'MESH':
+            self.report({'WARNING'}, "指定するSourceにメッシュオブジェクトを設定してください。")
+            return {'CANCELLED'}
+
+        if armature_obj is None or armature_obj.type != 'ARMATURE':
+            self.report({'WARNING'}, "指定するArmatureにアーマチュアを設定してください。")
+            return {'CANCELLED'}
+
+        if source_obj == target:
+            self.report({'WARNING'}, "Source and target mesh must be different objects.")
+            return {'CANCELLED'}
+
+        # Add and configure Data Transfer on the active target mesh.
+        transfer = target.modifiers.new(name="DataTransfer", type='DATA_TRANSFER')
+        transfer.object = source_obj
+        transfer.mix_mode = 'REPLACE'
+        transfer.mix_factor = 1.0
+        transfer.use_vert_data = True
+        transfer.data_types_verts = {'VGROUP_WEIGHTS'}
+        transfer.vert_mapping = 'NEAREST'
+
+        try:
+            # Generate the destination vertex-group data layers before transfer.
+            result = bpy.ops.object.datalayout_transfer(modifier=transfer.name)
+            if 'CANCELLED' in result:
+                raise RuntimeError("Generate Data Layers could not be executed.")
+
+            # Apply only the newly-created Data Transfer modifier.
+            result = bpy.ops.object.modifier_apply(modifier=transfer.name)
+            if 'CANCELLED' in result:
+                raise RuntimeError("Data Transfer modifier could not be applied.")
+
+            # Add the Armature modifier and move it to the top of the stack.
+            arm_mod = target.modifiers.new(name="Armature", type='ARMATURE')
+            arm_mod.object = armature_obj
+            arm_mod.use_vertex_groups = True
+            arm_mod.use_bone_envelopes = False
+            arm_mod.use_deform_preserve_volume = False
+            arm_mod.use_multi_modifier = False
+
+            arm_index = list(target.modifiers).index(arm_mod)
+            if arm_index != 0:
+                target.modifiers.move(arm_index, 0)
+
+        except Exception as exc:
+            # If Data Transfer has not yet been applied, remove the temporary modifier.
+            remaining = target.modifiers.get(transfer.name)
+            if remaining is not None:
+                target.modifiers.remove(remaining)
+            self.report({'ERROR'}, f"Data Transfer / Armature setup failed: {exc}")
+            return {'CANCELLED'}
+
+        self.report(
+            {'INFO'},
+            f"Vertex groups transferred to {target.name}; Armature modifier added."
+        )
+        return {'FINISHED'}
+
+
+class VIEW3D_PT_character_data_transfer(bpy.types.Panel):
+    bl_label = "Data Transfer + Armature"
+    bl_idname = "VIEW3D_PT_character_data_transfer"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Edit"
+    bl_order = 1
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and context.active_object is not None
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+
+        layout.prop(scene, "character_data_transfer_source", text="Source")
+        layout.prop(scene, "character_data_transfer_armature", text="Armature")
+        layout.separator()
+        layout.operator(
+            "object.transfer_vertex_groups_and_add_armature",
+            text="Generate",
+            icon='MOD_DATA_TRANSFER'
         )
 
 
@@ -431,6 +556,8 @@ classes = (
     MESH_OT_apply_character_offset,
     MESH_OT_create_offset_shrinkwrap_object,
     VIEW3D_PT_character_object_tool,
+    OBJECT_OT_transfer_vertex_groups_and_add_armature,
+    VIEW3D_PT_character_data_transfer,
 )
 
 
@@ -444,7 +571,7 @@ def unregister():
         except RuntimeError:
             pass
 
-    for prop in (SHADOW_PROP, LIGHT_PROP, SHADOW_POS_PROP, LIGHT_POS_PROP, TEXTURE_IMAGE_PROP, 'character_object_offset'):
+    for prop in (SHADOW_PROP, LIGHT_PROP, SHADOW_POS_PROP, LIGHT_POS_PROP, TEXTURE_IMAGE_PROP, 'character_object_offset', 'character_data_transfer_source', 'character_data_transfer_armature'):
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)
 
@@ -452,6 +579,20 @@ def unregister():
 def register():
     # Avoid duplicate registration when re-running the script.
     unregister()
+
+    bpy.types.Scene.character_data_transfer_source = bpy.props.PointerProperty(
+        name="Source",
+        description="Mesh object used as the source for vertex-group transfer",
+        type=bpy.types.Object,
+        poll=_is_mesh_object,
+    )
+    bpy.types.Scene.character_data_transfer_armature = bpy.props.PointerProperty(
+        name="Armature",
+        description="Armature object used by the new Armature modifier",
+        type=bpy.types.Object,
+        poll=_is_armature_object,
+    )
+
 
     bpy.types.Scene.ts_texture_image_v2 = bpy.props.PointerProperty(
         name="Texture Image",
